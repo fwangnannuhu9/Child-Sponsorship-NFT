@@ -1,4 +1,4 @@
-(define-non-fungible-token child-sponsorship-nft uint)
+﻿(define-non-fungible-token child-sponsorship-nft uint)
 
 (define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
@@ -12,9 +12,16 @@
 (define-constant err-insufficient-payment (err u108))
 (define-constant err-payment-not-due (err u109))
 (define-constant err-already-sponsored (err u110))
+(define-constant err-insufficient-emergency-fund (err u111))
+(define-constant err-invalid-emergency-request (err u112))
+(define-constant err-emergency-request-exists (err u113))
+(define-constant err-emergency-request-not-found (err u114))
+(define-constant err-emergency-request-not-approved (err u115))
 
 (define-data-var last-token-id uint u0)
 (define-data-var contract-locked bool false)
+(define-data-var emergency-fund-balance uint u0)
+(define-data-var last-emergency-request-id uint u0)
 
 (define-map children-registry
     {child-id: uint}
@@ -75,6 +82,31 @@
     }
 )
 
+(define-map emergency-fund-contributions
+    {contributor: principal}
+    {
+        total-contributed: uint,
+        last-contribution: uint,
+        contribution-count: uint
+    }
+)
+
+(define-map emergency-requests
+    {request-id: uint}
+    {
+        child-id: uint,
+        requested-amount: uint,
+        urgency-level: uint,
+        description: (string-ascii 500),
+        requested-by: principal,
+        requested-at: uint,
+        status: (string-ascii 20),
+        approved-by: (optional principal),
+        approved-at: (optional uint),
+        disbursed-at: (optional uint)
+    }
+)
+
 (define-read-only (get-last-token-id)
     (ok (var-get last-token-id))
 )
@@ -105,6 +137,18 @@
 
 (define-read-only (get-progress-update (child-id uint) (update-id uint))
     (ok (map-get? progress-updates {child-id: child-id, update-id: update-id}))
+)
+
+(define-read-only (get-emergency-fund-balance)
+    (ok (var-get emergency-fund-balance))
+)
+
+(define-read-only (get-emergency-request (request-id uint))
+    (ok (map-get? emergency-requests {request-id: request-id}))
+)
+
+(define-read-only (get-contributor-stats (contributor principal))
+    (ok (map-get? emergency-fund-contributions {contributor: contributor}))
 )
 
 (define-read-only (is-payment-due (token-id uint))
@@ -283,6 +327,95 @@
         )
         
         (ok update-id)
+    )
+)
+
+(define-public (contribute-to-emergency-fund (amount uint))
+    (let (
+        (current-balance (var-get emergency-fund-balance))
+        (current-height stacks-block-height)
+        (contributor-stats (default-to 
+            {total-contributed: u0, last-contribution: u0, contribution-count: u0}
+            (map-get? emergency-fund-contributions {contributor: tx-sender})
+        ))
+    )
+        (asserts! (> amount u0) err-insufficient-payment)
+        (asserts! (>= (stx-get-balance tx-sender) amount) err-insufficient-payment)
+        
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        (var-set emergency-fund-balance (+ current-balance amount))
+        
+        (map-set emergency-fund-contributions
+            {contributor: tx-sender}
+            {
+                total-contributed: (+ (get total-contributed contributor-stats) amount),
+                last-contribution: current-height,
+                contribution-count: (+ (get contribution-count contributor-stats) u1)
+            }
+        )
+        
+        (ok amount)
+    )
+)
+
+(define-public (request-emergency-funding (child-id uint) (amount uint) (urgency-level uint) (description (string-ascii 500)))
+    (let (
+        (child-info (unwrap! (map-get? children-registry {child-id: child-id}) err-child-not-found))
+        (request-id (+ (var-get last-emergency-request-id) u1))
+        (current-height stacks-block-height)
+    )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (get is-active child-info) err-child-not-found)
+        (asserts! (> amount u0) err-invalid-emergency-request)
+        (asserts! (<= urgency-level u5) err-invalid-emergency-request)
+        (asserts! (<= amount (var-get emergency-fund-balance)) err-insufficient-emergency-fund)
+        
+        (map-set emergency-requests
+            {request-id: request-id}
+            {
+                child-id: child-id,
+                requested-amount: amount,
+                urgency-level: urgency-level,
+                description: description,
+                requested-by: tx-sender,
+                requested-at: current-height,
+                status: "pending",
+                approved-by: none,
+                approved-at: none,
+                disbursed-at: none
+            }
+        )
+        
+        (var-set last-emergency-request-id request-id)
+        (ok request-id)
+    )
+)
+
+(define-public (approve-emergency-request (request-id uint))
+    (let (
+        (request-info (unwrap! (map-get? emergency-requests {request-id: request-id}) err-emergency-request-not-found))
+        (current-height stacks-block-height)
+        (requested-amount (get requested-amount request-info))
+        (current-balance (var-get emergency-fund-balance))
+    )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-eq (get status request-info) "pending") err-invalid-emergency-request)
+        (asserts! (<= requested-amount current-balance) err-insufficient-emergency-fund)
+        
+        (var-set emergency-fund-balance (- current-balance requested-amount))
+        
+        (map-set emergency-requests
+            {request-id: request-id}
+            (merge request-info {
+                status: "approved",
+                approved-by: (some tx-sender),
+                approved-at: (some current-height),
+                disbursed-at: (some current-height)
+            })
+        )
+        
+        (ok requested-amount)
     )
 )
 
