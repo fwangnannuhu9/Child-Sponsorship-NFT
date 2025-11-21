@@ -17,6 +17,8 @@
 (define-constant err-emergency-request-exists (err u113))
 (define-constant err-emergency-request-not-found (err u114))
 (define-constant err-emergency-request-not-approved (err u115))
+(define-constant err-no-payment-record (err u116))
+(define-constant err-already-disbursed (err u117))
 
 (define-data-var last-token-id uint u0)
 (define-data-var contract-locked bool false)
@@ -32,6 +34,7 @@
         education-level: (string-ascii 30),
         monthly-support-needed: uint,
         sponsor: (optional principal),
+        wallet: principal,
         created-at: uint,
         is-active: bool
     }
@@ -44,6 +47,14 @@
         paid-at: uint,
         sponsor: principal,
         status: (string-ascii 10)
+    }
+)
+(define-map payment-disbursements
+    {token-id: uint, payment-number: uint}
+    {
+        disbursed: bool,
+        disbursed-at: uint,
+        recipient: principal
     }
 )
 
@@ -151,6 +162,10 @@
     (ok (map-get? emergency-fund-contributions {contributor: contributor}))
 )
 
+(define-read-only (get-disbursement-status (token-id uint) (payment-number uint))
+    (ok (map-get? payment-disbursements {token-id: token-id, payment-number: payment-number}))
+)
+
 (define-read-only (is-payment-due (token-id uint))
     (let (
         (metadata (unwrap! (map-get? token-metadata {token-id: token-id}) (err err-listing-not-found)))
@@ -164,7 +179,7 @@
 )
 
 (define-public (register-child (name (string-ascii 50)) (age uint) (location (string-ascii 100)) 
-                              (education-level (string-ascii 30)) (monthly-support uint))
+                              (education-level (string-ascii 30)) (monthly-support uint) (wallet principal))
     (let (
         (child-id (+ (var-get last-token-id) u1))
         (current-height stacks-block-height)
@@ -181,6 +196,7 @@
                 education-level: education-level,
                 monthly-support-needed: monthly-support,
                 sponsor: none,
+                wallet: wallet,
                 created-at: current-height,
                 is-active: true
             }
@@ -288,6 +304,33 @@
         )
         
         (ok payment-number)
+    )
+)
+
+(define-public (disburse-monthly-support (token-id uint) (payment-number uint))
+    (let (
+        (metadata (unwrap! (map-get? token-metadata {token-id: token-id}) err-listing-not-found))
+        (child-id (get child-id metadata))
+        (payment (unwrap! (map-get? sponsorship-payments {token-id: token-id, payment-number: payment-number}) err-no-payment-record))
+        (amount (get amount payment))
+        (child-info (unwrap! (map-get? children-registry {child-id: child-id}) err-child-not-found))
+        (wallet (get wallet child-info))
+        (disb (default-to {disbursed: false, disbursed-at: u0, recipient: tx-sender} (map-get? payment-disbursements {token-id: token-id, payment-number: payment-number})))
+        (current-height stacks-block-height)
+    )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-eq (get status payment) "completed") err-payment-not-due)
+        (asserts! (not (get disbursed disb)) err-already-disbursed)
+        (try! (as-contract (stx-transfer? amount tx-sender wallet)))
+        (map-set payment-disbursements
+            {token-id: token-id, payment-number: payment-number}
+            {
+                disbursed: true,
+                disbursed-at: current-height,
+                recipient: wallet
+            }
+        )
+        (ok true)
     )
 )
 
